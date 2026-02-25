@@ -1,0 +1,195 @@
+# 🔮 Nexus Chat — Full-Stack Real-Time Chat App
+
+A production-grade multi-client chat application built with **Node.js + Socket.IO** (server) and **React + Vite** (client), using **Appwrite** for authentication, persistence, and file storage.
+
+---
+
+## ✨ Features
+
+| Feature | Details |
+|---|---|
+| 🔐 Auth | Login / Register / Google OAuth via Appwrite |
+| 💬 Chatrooms | Join public channels, broadcast to all members |
+| 📩 Direct Messages | Private 1-to-1 messaging |
+| 🖼️ Media Sharing | Send images & files in chats |
+| ⌨️ Typing Indicators | Real-time "X is typing…" |
+| 👥 Online Presence | See who's online live |
+| 🛡️ Troll Detection | Server auto-detects hostile messages, sends soothing warnings |
+| 🔒 Private Info Alert | Detects OTPs/passwords in group chats, asks for confirmation |
+| 😶‍🌫️ Cool-down Mute | Repeat offenders get a 60-second mute with a kind message |
+| 🤖 Gemini AI | Optional AI-powered soothing messages (set GEMINI_API_KEY) |
+
+---
+
+## 🏗️ Architecture
+
+```
+nexus-chat/
+├── server/          # Node.js + Express + Socket.IO backend
+│   ├── index.js     # Main server (sockets, troll detection, file upload)
+│   ├── .env.example
+│   └── package.json
+└── client/          # React + Vite + Tailwind frontend
+    ├── src/
+    │   ├── contexts/    # AuthContext, ChatContext (all socket logic)
+    │   ├── pages/       # LoginPage, ChatPage
+    │   ├── components/  # Sidebar, ChatArea, Message, MessageInput, Overlays
+    │   └── lib/         # appwrite.js, socket.js
+    └── package.json
+```
+
+---
+
+## 🔧 Backend Stack
+
+| Tech | Role |
+|---|---|
+| **Node.js + Express** | HTTP server, file upload endpoint |
+| **Socket.IO** | Real-time bidirectional communication |
+| **Appwrite (server SDK)** | Persist messages to database |
+| **Multer** | Handle file uploads |
+| **Gemini API** (optional) | AI-generated soothing responses |
+
+---
+
+## 🚀 Appwrite Setup (Step-by-Step)
+
+### 1. Create an Appwrite Account
+Go to [https://cloud.appwrite.io](https://cloud.appwrite.io) → Sign up → Create a new project.
+
+### 2. Get Your Project ID
+Dashboard → Settings → Copy **Project ID**.
+
+### 3. Create a Database
+- Go to **Databases** → Create Database
+- Note the **Database ID**
+
+### 4. Create Collections
+
+#### `messages` collection
+Add these attributes:
+| Attribute | Type | Required |
+|---|---|---|
+| roomId | String (255) | ✅ |
+| senderId | String (255) | ✅ |
+| senderName | String (255) | ✅ |
+| text | String (5000) | ❌ |
+| fileUrl | String (2000) | ❌ |
+| fileType | String (100) | ❌ |
+
+> Permissions: **Any** can create. Authenticated users can read.
+
+#### `rooms` collection
+Add these attributes:
+| Attribute | Type | Required |
+|---|---|---|
+| name | String (100) | ✅ |
+| description | String (500) | ❌ |
+| isPrivate | Boolean | ❌ |
+
+> Add some initial room documents: `general`, `random`, `tech`
+
+### 5. Create a Storage Bucket
+- Go to **Storage** → Create Bucket: `chat-media`
+- Max file size: 50MB
+- Permissions: Authenticated users can create/read
+
+### 6. Create an API Key (for server)
+- Go to **Settings** → **API Keys** → Create Key
+- Scopes needed: `databases.read`, `databases.write`, `storage.read`, `storage.write`
+
+### 7. Add Platform (for client)
+- Go to **Settings** → **Platforms** → Add Platform → **Web**
+- Hostname: `localhost` (for dev), your domain for production
+
+### 8. Enable Google OAuth (optional)
+- Go to **Auth** → **Settings** → **OAuth2 Providers** → Enable Google
+- Add your Google OAuth credentials
+
+---
+
+## ⚙️ Environment Variables
+
+### Server (`server/.env`)
+```env
+PORT=3001
+CLIENT_URL=http://localhost:5173
+
+APPWRITE_ENDPOINT=https://cloud.appwrite.io/v1
+APPWRITE_PROJECT_ID=xxx
+APPWRITE_API_KEY=xxx
+APPWRITE_DATABASE_ID=xxx
+APPWRITE_MESSAGES_COLLECTION_ID=messages
+APPWRITE_ROOMS_COLLECTION_ID=rooms
+APPWRITE_BUCKET_ID=chat-media
+
+# Optional
+GEMINI_API_KEY=your_gemini_key
+```
+
+### Client (`client/.env`)
+```env
+VITE_APPWRITE_ENDPOINT=https://cloud.appwrite.io/v1
+VITE_APPWRITE_PROJECT_ID=xxx
+VITE_APPWRITE_DATABASE_ID=xxx
+VITE_SERVER_URL=http://localhost:3001
+```
+
+---
+
+## 🏃 Running Locally
+
+```bash
+# 1. Clone / download this project
+
+# 2. Setup server
+cd server
+npm install
+cp .env.example .env   # fill in your values
+npm run dev            # starts on :3001
+
+# 3. Setup client (new terminal)
+cd client
+npm install
+cp .env.example .env   # fill in your values
+npm run dev            # starts on :5173
+```
+
+Open [http://localhost:5173](http://localhost:5173) — register an account and start chatting!
+
+---
+
+## 🤖 Troll Detection Logic
+
+The server checks messages for combinations of aggressive keywords. If 2+ are found (or 1 in a very short message):
+1. The message is **blocked** (not sent to the room)
+2. The sender gets a **warm, non-judgmental toast notification**
+3. After **3 offenses**, the user is muted for 60 seconds
+4. If `GEMINI_API_KEY` is set, the soothing message is generated by Gemini AI
+
+---
+
+## 🔒 Private Info Detection
+
+When sending to a **group room**, the server scans for:
+- OTP patterns (`4-8 digit numbers` near words like "otp", "code", "verify")
+- Passwords (`password: xxx` patterns)
+- Credit card numbers
+- SSNs
+
+If detected, the message is held and the sender sees a **confirmation modal** before it goes to the group.
+
+---
+
+## 🚢 Deployment Tips
+
+| Service | How |
+|---|---|
+| **Server** | Deploy to Railway / Render / Fly.io |
+| **Client** | Deploy to Vercel / Netlify |
+| **Appwrite** | Already cloud-hosted (or self-host with Docker) |
+
+Remember to:
+- Update `CLIENT_URL` on server to your deployed frontend URL
+- Update `VITE_SERVER_URL` on client to your deployed server URL
+- Add your production domain as a Platform in Appwrite
