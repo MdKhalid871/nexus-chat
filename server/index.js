@@ -6,9 +6,9 @@ import dotenv from 'dotenv';
 import { Client, Databases, Storage, ID, Query } from 'node-appwrite';
 import multer from 'multer';
 import { v4 as uuidv4 } from 'uuid';
-import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fs from 'fs';
 
 dotenv.config();
 
@@ -16,10 +16,17 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const httpServer = createServer(app);
 
-app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:5173', credentials: true }));
-app.use(express.json());
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
+app.use(cors({ origin: '*', credentials: true }));
+app.use(express.json({ limit: '50mb' }));
 
-// Appwrite setup
+// ─── Static uploads folder ────────────────────────────────────────────────────
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+app.use('/uploads', express.static(UPLOADS_DIR));
+
+// ─── Appwrite setup ───────────────────────────────────────────────────────────
 const appwriteClient = new Client()
   .setEndpoint(process.env.APPWRITE_ENDPOINT || 'https://cloud.appwrite.io/v1')
   .setProject(process.env.APPWRITE_PROJECT_ID || '')
@@ -33,35 +40,32 @@ const MESSAGES_COL = process.env.APPWRITE_MESSAGES_COLLECTION_ID || 'messages';
 const ROOMS_COL = process.env.APPWRITE_ROOMS_COLLECTION_ID || 'rooms';
 const BUCKET_ID = process.env.APPWRITE_BUCKET_ID || 'chat-media';
 
-// Socket.IO
+// ─── Socket.IO ────────────────────────────────────────────────────────────────
 const io = new Server(httpServer, {
-  cors: { origin: process.env.CLIENT_URL || 'http://localhost:5173', methods: ['GET', 'POST'] },
-  maxHttpBufferSize: 50e6, // 50MB for media
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+  maxHttpBufferSize: 50e6,
 });
 
-// In-memory state
-const onlineUsers = new Map(); // socketId -> { userId, username, avatar }
-const userSockets = new Map(); // userId -> socketId
-const roomMembers = new Map(); // roomId -> Set of userIds
-const messageHistory = new Map(); // roomId -> last 50 messages (for troll context)
+// ─── In-memory state ──────────────────────────────────────────────────────────
+const onlineUsers = new Map();
+const userSockets = new Map();
+const roomMembers = new Map();
+const messageHistory = new Map();
 
-// ─── Troll Detection ────────────────────────────────────────────────────────
+// ─── Troll Detection ──────────────────────────────────────────────────────────
 const TROLL_KEYWORDS = [
   'stupid', 'idiot', 'moron', 'dumb', 'hate you', 'loser', 'shut up',
   'trash', 'garbage', 'worthless', 'kill yourself', 'die', 'ugly',
 ];
-
-const trollCounts = new Map(); // userId -> { count, lastReset }
-const bannedTopics = new Set(); // Set of topic fingerprints
+const trollCounts = new Map();
 
 function detectTroll(text) {
   const lower = text.toLowerCase();
   const found = TROLL_KEYWORDS.filter(kw => lower.includes(kw));
-  return { isTroll: found.length >= 2 || (found.length === 1 && lower.split(' ').length < 6), keywords: found };
-}
-
-function detectOTP(text) {
-  return /\b\d{4,8}\b/.test(text) && /(otp|code|verify|pin|passcode|one.?time)/i.test(text);
+  return {
+    isTroll: found.length >= 2 || (found.length === 1 && lower.split(' ').length < 6),
+    keywords: found
+  };
 }
 
 function detectPrivateInfo(text) {
@@ -71,7 +75,6 @@ function detectPrivateInfo(text) {
     { type: 'Credit Card', regex: /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/ },
     { type: 'SSN', regex: /\b\d{3}-\d{2}-\d{4}\b/ },
   ];
-
   for (const p of patterns) {
     if (p.regex.test(text) && (!p.context || p.context.test(text))) {
       return { detected: true, type: p.type };
@@ -80,8 +83,7 @@ function detectPrivateInfo(text) {
   return { detected: false };
 }
 
-async function getSoothingResponse(trolledMessages, keywords) {
-  // If Gemini key exists, use it; otherwise return a default
+async function getSoothingResponse(text, keywords) {
   if (process.env.GEMINI_API_KEY) {
     try {
       const response = await fetch(
@@ -92,61 +94,71 @@ async function getSoothingResponse(trolledMessages, keywords) {
           body: JSON.stringify({
             contents: [{
               parts: [{
-                text: `Someone in a chat used these words considered aggressive: "${keywords.join(', ')}". 
-                Write a SHORT, warm, non-judgmental message (2-3 sentences) to gently remind them that 
-                everyone here is human and deserves respect. Make it feel like it comes from a caring 
-                friend, not a robot. Don't be preachy. Be understanding.`
+                text: `Someone in a chat used these aggressive words: "${keywords.join(', ')}". 
+                Write a SHORT, warm, non-judgmental message (2-3 sentences) to gently remind them 
+                that everyone here is human and deserves respect. Sound like a caring friend, not a bot.`
               }]
             }]
           })
         }
       );
       const data = await response.json();
-      return data.candidates?.[0]?.content?.parts?.[0]?.text || defaultSoothingMessage(keywords);
-    } catch { return defaultSoothingMessage(keywords); }
+      return data.candidates?.[0]?.content?.parts?.[0]?.text || defaultSoothingMessage();
+    } catch { return defaultSoothingMessage(); }
   }
-  return defaultSoothingMessage(keywords);
+  return defaultSoothingMessage();
 }
 
-function defaultSoothingMessage(keywords) {
+function defaultSoothingMessage() {
   const messages = [
-    "Hey, take a breath! 💙 Everyone here is going through something — a little kindness goes a long way. We're all in this together.",
-    "Seems like things are heating up! 🌿 It's totally okay to feel frustrated, but let's keep this space a safe one for everyone. You good?",
-    "We noticed your message was a bit intense. That's okay — we all have those moments. How about we reset and keep the vibes positive? ✨",
-    "Just a gentle nudge — this community thrives on good energy. Your words matter more than you know. Let's keep it cool 🤙",
+    "Hey, take a breath! 💙 Everyone here is going through something — a little kindness goes a long way.",
+    "Seems like things got heated! 🌿 It's okay to feel frustrated, but let's keep this space safe for everyone.",
+    "We noticed your message was a bit intense. That's okay — we all have those moments. Let's reset! ✨",
+    "Just a gentle nudge — this community thrives on good energy. Your words matter more than you know 🤙",
   ];
   return messages[Math.floor(Math.random() * messages.length)];
 }
 
-// ─── File Upload ─────────────────────────────────────────────────────────────
-const upload = multer({ 
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }
+// ─── File Upload (saves to disk, serves as static) ────────────────────────────
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+    filename: (req, file, cb) => {
+      const uniqueName = `${Date.now()}-${uuidv4()}${path.extname(file.originalname)}`;
+      cb(null, uniqueName);
+    }
+  }),
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
 });
 
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'No file' });
-    const fileId = ID.unique();
-    // In production: upload to Appwrite storage
-    // const result = await storage.createFile(BUCKET_ID, fileId, InputFile.fromBuffer(req.file.buffer, req.file.originalname));
-    // For demo, we'll base64 it (in prod use Appwrite storage URL)
-    const base64 = req.file.buffer.toString('base64');
-    const dataUrl = `data:${req.file.mimetype};base64,${base64}`;
-    res.json({ fileId, url: dataUrl, name: req.file.originalname, mimetype: req.file.mimetype });
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const SERVER_HOST = process.env.SERVER_HOST || `http://localhost:${process.env.PORT || 3001}`;
+    const fileUrl = `${SERVER_HOST}/uploads/${req.file.filename}`;
+
+    console.log(`📁 File uploaded: ${req.file.originalname} → ${req.file.filename}`);
+
+    res.json({
+      fileId: req.file.filename,
+      url: fileUrl,
+      name: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+    });
   } catch (err) {
-    console.error('Upload error:', err);
-    res.status(500).json({ error: 'Upload failed' });
+    console.error('❌ Upload error:', err);
+    res.status(500).json({ error: 'Upload failed: ' + err.message });
   }
 });
 
-// ─── REST: Get rooms & messages ───────────────────────────────────────────────
+// ─── REST: Rooms ──────────────────────────────────────────────────────────────
 app.get('/rooms', async (req, res) => {
   try {
     const response = await databases.listDocuments(DB_ID, ROOMS_COL);
     res.json(response.documents);
   } catch {
-    // Return demo rooms if Appwrite not configured
     res.json([
       { $id: 'general', name: 'General', description: 'General chat for everyone', isPrivate: false },
       { $id: 'random', name: 'Random', description: 'Off-topic discussions', isPrivate: false },
@@ -155,6 +167,7 @@ app.get('/rooms', async (req, res) => {
   }
 });
 
+// ─── REST: Messages ───────────────────────────────────────────────────────────
 app.get('/messages/:roomId', async (req, res) => {
   try {
     const response = await databases.listDocuments(DB_ID, MESSAGES_COL, [
@@ -170,9 +183,9 @@ app.get('/messages/:roomId', async (req, res) => {
 
 // ─── Socket.IO Events ─────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
-  console.log('🔌 Socket connected:', socket.id);
+  console.log('🔌 Connected:', socket.id);
 
-  // ── Auth / Join ──
+  // Auth
   socket.on('auth', ({ userId, username, avatar }) => {
     onlineUsers.set(socket.id, { userId, username, avatar, socketId: socket.id });
     userSockets.set(userId, socket.id);
@@ -180,31 +193,22 @@ io.on('connection', (socket) => {
     console.log(`👤 ${username} authenticated`);
   });
 
-  // ── Join Room ──
-  socket.on('join_room', async ({ roomId }) => {
+  // Join Room
+  socket.on('join_room', ({ roomId }) => {
     socket.join(roomId);
     if (!roomMembers.has(roomId)) roomMembers.set(roomId, new Set());
     const user = onlineUsers.get(socket.id);
-    if (user) roomMembers.get(roomId).add(user.userId);
-
-    // Send room member list
-    const members = Array.from(roomMembers.get(roomId)).map(uid => {
-      const sId = userSockets.get(uid);
-      return sId ? onlineUsers.get(sId) : null;
-    }).filter(Boolean);
-    io.to(roomId).emit('room_members', { roomId, members });
-
-    // System message
     if (user) {
+      roomMembers.get(roomId).add(user.userId);
       io.to(roomId).emit('system_message', {
         roomId,
-        text: `${user.username} joined the room`,
+        text: `${user.username} joined`,
         timestamp: new Date().toISOString(),
       });
     }
   });
 
-  // ── Leave Room ──
+  // Leave Room
   socket.on('leave_room', ({ roomId }) => {
     socket.leave(roomId);
     const user = onlineUsers.get(socket.id);
@@ -212,20 +216,20 @@ io.on('connection', (socket) => {
       roomMembers.get(roomId).delete(user.userId);
       io.to(roomId).emit('system_message', {
         roomId,
-        text: `${user.username} left the room`,
+        text: `${user.username} left`,
         timestamp: new Date().toISOString(),
       });
     }
   });
 
-  // ── Send Room Message ──
+  // Room Message
   socket.on('room_message', async (data) => {
-    const { roomId, text, fileUrl, fileName, fileType } = data;
+    const { roomId, text, fileUrl, fileName, fileType, confirmed } = data;
     const user = onlineUsers.get(socket.id);
     if (!user) return;
 
-    // Check for private info in GROUP messages
-    if (text) {
+    // Private info check (only for text, not files)
+    if (text && !confirmed) {
       const privateCheck = detectPrivateInfo(text);
       if (privateCheck.detected) {
         socket.emit('private_info_warning', {
@@ -233,34 +237,42 @@ io.on('connection', (socket) => {
           message: `⚠️ Your message appears to contain a ${privateCheck.type}. Are you sure you want to share this in a group chat?`,
           pendingMessage: data,
         });
-        return; // Hold the message — client will confirm and re-send with confirmed: true
+        return;
       }
     }
 
-    // Troll detection
-    if (text && !data.confirmed) {
+    // Troll detection (only for text)
+    if (text && !confirmed) {
       const { isTroll, keywords } = detectTroll(text);
       if (isTroll) {
-        const count = trollCounts.get(user.userId) || { count: 0 };
-        count.count++;
-        trollCounts.set(user.userId, count);
+        const countData = trollCounts.get(user.userId) || { count: 0 };
+        countData.count++;
+        trollCounts.set(user.userId, countData);
 
         const soothingMsg = await getSoothingResponse(text, keywords);
         socket.emit('troll_warning', {
           message: soothingMsg,
-          severity: count.count >= 3 ? 'muted' : 'warning',
+          severity: countData.count >= 3 ? 'muted' : 'warning',
         });
 
-        if (count.count >= 3) {
-          socket.emit('muted', { duration: 60000, message: '🤫 You\'ve been given a 60-second cool-down period. Take a breather!' });
+        if (countData.count >= 3) {
+          socket.emit('muted', { message: "🤫 You've been given a 60-second cool-down. Take a breather!" });
           setTimeout(() => {
             trollCounts.set(user.userId, { count: 0 });
-            socket.emit('unmuted', { message: '✅ You\'re back! Remember, let\'s keep it positive 💪' });
+            socket.emit('unmuted', { message: "✅ You're back! Let's keep it positive 💪" });
           }, 60000);
-          return;
         }
-        return; // Block the troll message
+        return;
       }
+    }
+
+    // Determine message type
+    let msgType = 'text';
+    if (fileUrl) {
+      const mime = fileType || '';
+      if (mime.startsWith('image/')) msgType = 'image';
+      else if (mime.startsWith('video/')) msgType = 'video';
+      else msgType = 'file';
     }
 
     const message = {
@@ -274,35 +286,49 @@ io.on('connection', (socket) => {
       fileName: fileName || null,
       fileType: fileType || null,
       timestamp: new Date().toISOString(),
-      type: fileUrl ? (fileType?.startsWith('image') ? 'image' : 'file') : 'text',
+      type: msgType,
     };
 
-    // Track for troll context
+    // Store history for troll context
     if (!messageHistory.has(roomId)) messageHistory.set(roomId, []);
-    messageHistory.get(roomId).push({ text, sender: user.username });
-    if (messageHistory.get(roomId).length > 50) messageHistory.get(roomId).shift();
+    const history = messageHistory.get(roomId);
+    history.push({ text, sender: user.username });
+    if (history.length > 50) history.shift();
 
-    // Broadcast to room
+    // Broadcast to everyone in room
     io.to(roomId).emit('room_message', message);
+    console.log(`💬 [${roomId}] ${user.username}: ${text || '[file]'}`);
 
-    // Persist to Appwrite (best-effort)
+    // Persist to Appwrite (non-blocking)
     try {
       await databases.createDocument(DB_ID, MESSAGES_COL, ID.unique(), {
-        roomId, senderId: user.userId, senderName: user.username,
-        text: text || '', fileUrl: fileUrl || '', fileType: fileType || '',
+        roomId,
+        senderId: user.userId,
+        senderName: user.username,
+        text: text || '',
+        fileUrl: fileUrl || '',
+        fileType: fileType || '',
       });
     } catch { /* non-fatal */ }
   });
 
-  // ── Direct Message ──
-  socket.on('direct_message', async (data) => {
+  // Direct Message
+  socket.on('direct_message', (data) => {
     const { toUserId, text, fileUrl, fileName, fileType } = data;
     const user = onlineUsers.get(socket.id);
     if (!user) return;
 
+    let msgType = 'text';
+    if (fileUrl) {
+      const mime = fileType || '';
+      if (mime.startsWith('image/')) msgType = 'image';
+      else if (mime.startsWith('video/')) msgType = 'video';
+      else msgType = 'file';
+    }
+
     const message = {
       id: uuidv4(),
-      type: fileUrl ? (fileType?.startsWith('image') ? 'image' : 'file') : 'text',
+      type: msgType,
       senderId: user.userId,
       senderName: user.username,
       senderAvatar: user.avatar,
@@ -315,45 +341,40 @@ io.on('connection', (socket) => {
       isDM: true,
     };
 
-    // Send to recipient
     const recipientSocketId = userSockets.get(toUserId);
-    if (recipientSocketId) {
-      io.to(recipientSocketId).emit('direct_message', message);
-    }
-    // Echo to sender
+    if (recipientSocketId) io.to(recipientSocketId).emit('direct_message', message);
     socket.emit('direct_message', message);
   });
 
-  // ── Typing Indicators ──
+  // Typing
   socket.on('typing_start', ({ roomId, toUserId }) => {
     const user = onlineUsers.get(socket.id);
     if (!user) return;
     if (roomId) {
       socket.to(roomId).emit('typing', { userId: user.userId, username: user.username, roomId });
     } else if (toUserId) {
-      const recipientSid = userSockets.get(toUserId);
-      if (recipientSid) io.to(recipientSid).emit('typing', { userId: user.userId, username: user.username, isDM: true });
+      const sid = userSockets.get(toUserId);
+      if (sid) io.to(sid).emit('typing', { userId: user.userId, username: user.username, isDM: true });
     }
   });
 
   socket.on('typing_stop', ({ roomId, toUserId }) => {
     const user = onlineUsers.get(socket.id);
     if (!user) return;
-    if (roomId) socket.to(roomId).emit('stop_typing', { userId: user.userId, roomId });
-    else if (toUserId) {
-      const recipientSid = userSockets.get(toUserId);
-      if (recipientSid) io.to(recipientSid).emit('stop_typing', { userId: user.userId, isDM: true });
+    if (roomId) {
+      socket.to(roomId).emit('stop_typing', { userId: user.userId, username: user.username, roomId });
+    } else if (toUserId) {
+      const sid = userSockets.get(toUserId);
+      if (sid) io.to(sid).emit('stop_typing', { userId: user.userId, username: user.username, isDM: true });
     }
   });
 
-  // ── Confirm Private Info Send ──
+  // Confirm private info send
   socket.on('confirm_send', (data) => {
-    data.confirmed = true;
-    socket.emit('room_message_confirmed', data);
-    socket.emit('trigger_room_message', data); // client re-emits room_message
+    socket.emit('trigger_room_message', { ...data, confirmed: true });
   });
 
-  // ── Disconnect ──
+  // Disconnect
   socket.on('disconnect', () => {
     const user = onlineUsers.get(socket.id);
     if (user) {
@@ -370,7 +391,7 @@ io.on('connection', (socket) => {
       });
       io.emit('online_users', Array.from(onlineUsers.values()));
     }
-    console.log('🔌 Socket disconnected:', socket.id);
+    console.log('🔌 Disconnected:', socket.id);
   });
 });
 
