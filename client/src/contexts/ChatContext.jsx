@@ -4,24 +4,36 @@ import { useAuth } from './AuthContext';
 
 const ChatContext = createContext(null);
 
+const FALLBACK_ROOMS = [
+  { $id: 'general', name: 'General', description: 'General chat for everyone', isPrivate: false },
+  { $id: 'random', name: 'Random', description: 'Off-topic discussions', isPrivate: false },
+  { $id: 'tech', name: 'Tech Talk', description: 'All things technology', isPrivate: false },
+];
+
 export function ChatProvider({ children }) {
   const { user } = useAuth();
   const [onlineUsers, setOnlineUsers] = useState([]);
-  const [rooms, setRooms] = useState([]);
+  const [rooms, setRooms] = useState(FALLBACK_ROOMS);
   const [activeRoom, setActiveRoom] = useState(null);
   const [activeDM, setActiveDM] = useState(null);
-  const [messages, setMessages] = useState({}); // roomId/userId -> messages[]
-  const [dmMessages, setDmMessages] = useState({}); // toUserId -> messages[]
-  const [typingUsers, setTypingUsers] = useState({}); // roomId -> Set of usernames
+  const [messages, setMessages] = useState({});
+  const [dmMessages, setDmMessages] = useState({});
+  const [typingUsers, setTypingUsers] = useState({});
   const [trollWarning, setTrollWarning] = useState(null);
   const [privateInfoWarning, setPrivateInfoWarning] = useState(null);
   const [notification, setNotification] = useState(null);
   const [muted, setMuted] = useState(false);
-  const typingTimerRef = useRef({});
+  const activeRoomRef = useRef(null);
 
   useEffect(() => {
     if (!user) return;
+
+    if (!activeRoomRef.current) {
+      joinRoom(FALLBACK_ROOMS[0]);
+    }
+
     fetchRooms();
+
     const socket = getSocket();
 
     socket.on('online_users', setOnlineUsers);
@@ -53,30 +65,52 @@ export function ChatProvider({ children }) {
 
   async function fetchRooms() {
     try {
-      const res = await fetch(`${import.meta.env.VITE_SERVER_URL || 'http://localhost:3001'}/rooms`);
-      const data = await res.json();
-      setRooms(data);
-      if (data.length > 0 && !activeRoom) {
-        joinRoom(data[0]);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+      const res = await fetch(
+        `${import.meta.env.VITE_SERVER_URL || 'http://localhost:3001'}/rooms`,
+        { signal: controller.signal }
+      );
+      clearTimeout(timeout);
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.length > 0) {
+          setRooms(data);
+        }
       }
-    } catch { }
+    } catch {
+      console.log('Server unreachable — using fallback rooms');
+    }
   }
 
   function joinRoom(room) {
     const socket = getSocket();
-    if (activeRoom) socket.emit('leave_room', { roomId: activeRoom.$id });
-    setActiveRoom(room);
+    const roomId = room.$id || room.id;
+    const normalizedRoom = { ...room, $id: roomId };
+
+    if (activeRoomRef.current) {
+      socket.emit('leave_room', { roomId: activeRoomRef.current.$id });
+    }
+
+    activeRoomRef.current = normalizedRoom;
+    setActiveRoom(normalizedRoom);
     setActiveDM(null);
-    socket.emit('join_room', { roomId: room.$id });
-    // Load history
-    fetch(`${import.meta.env.VITE_SERVER_URL || 'http://localhost:3001'}/messages/${room.$id}`)
+    socket.emit('join_room', { roomId });
+
+    const SERVER = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
+    fetch(`${SERVER}/messages/${roomId}`)
       .then(r => r.json())
-      .then(msgs => setMessages(prev => ({ ...prev, [room.$id]: msgs })))
+      .then(msgs => {
+        if (Array.isArray(msgs)) {
+          setMessages(prev => ({ ...prev, [roomId]: msgs }));
+        }
+      })
       .catch(() => { });
   }
 
   function openDM(targetUser) {
     setActiveDM(targetUser);
+    activeRoomRef.current = null;
     setActiveRoom(null);
   }
 
@@ -94,10 +128,13 @@ export function ChatProvider({ children }) {
 
   function handleSystemMessage(msg) {
     const sysMsg = { ...msg, id: Date.now(), type: 'system', text: msg.text };
-    setMessages(prev => ({ ...prev, [msg.roomId]: [...(prev[msg.roomId] || []), sysMsg] }));
+    setMessages(prev => ({
+      ...prev,
+      [msg.roomId]: [...(prev[msg.roomId] || []), sysMsg]
+    }));
   }
 
-  function handleTyping({ userId, username, roomId, isDM }) {
+  function handleTyping({ userId, username, roomId }) {
     if (userId === user?.$id) return;
     if (roomId) {
       setTypingUsers(prev => ({
@@ -107,7 +144,7 @@ export function ChatProvider({ children }) {
     }
   }
 
-  function handleStopTyping({ userId, username, roomId, isDM }) {
+  function handleStopTyping({ username, roomId }) {
     if (roomId) {
       setTypingUsers(prev => {
         const set = new Set(prev[roomId] || []);
@@ -132,10 +169,10 @@ export function ChatProvider({ children }) {
   }
 
   function sendRoomMessage(text, fileData = null) {
-    if (!activeRoom || muted) return;
+    if (!activeRoomRef.current || muted) return;
     const socket = getSocket();
     socket.emit('room_message', {
-      roomId: activeRoom.$id,
+      roomId: activeRoomRef.current.$id,
       text: text || null,
       ...(fileData || {}),
     });
@@ -154,14 +191,20 @@ export function ChatProvider({ children }) {
 
   function emitTypingStart() {
     const socket = getSocket();
-    if (activeRoom) socket.emit('typing_start', { roomId: activeRoom.$id });
-    else if (activeDM) socket.emit('typing_start', { toUserId: activeDM.$id || activeDM.userId });
+    if (activeRoomRef.current) {
+      socket.emit('typing_start', { roomId: activeRoomRef.current.$id });
+    } else if (activeDM) {
+      socket.emit('typing_start', { toUserId: activeDM.$id || activeDM.userId });
+    }
   }
 
   function emitTypingStop() {
     const socket = getSocket();
-    if (activeRoom) socket.emit('typing_stop', { roomId: activeRoom.$id });
-    else if (activeDM) socket.emit('typing_stop', { toUserId: activeDM.$id || activeDM.userId });
+    if (activeRoomRef.current) {
+      socket.emit('typing_stop', { roomId: activeRoomRef.current.$id });
+    } else if (activeDM) {
+      socket.emit('typing_stop', { toUserId: activeDM.$id || activeDM.userId });
+    }
   }
 
   function confirmPrivateInfoSend() {
