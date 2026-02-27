@@ -70,11 +70,25 @@ function detectTroll(text) {
 
 function detectPrivateInfo(text) {
   const patterns = [
-    { type: 'OTP', regex: /\b\d{4,8}\b/, context: /(otp|code|verify|pin|passcode|one.?time)/i },
-    { type: 'Password', regex: /(password|passwd|pwd)\s*[:=]\s*\S+/i },
-    { type: 'Credit Card', regex: /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/ },
-    { type: 'SSN', regex: /\b\d{3}-\d{2}-\d{4}\b/ },
-  ];
+  {
+    type: 'OTP',
+    // 4–8 alphanumeric characters (at least one digit)
+    regex: /\b(?=[A-Za-z0-9]{4,8}\b)(?=.*\d)[A-Za-z0-9]+\b/,
+    context: /(otp|code|verify|pin|passcode|one.?time)/i
+  },
+  { 
+    type: 'Password', 
+    regex: /(password|passwd|pwd)\s*[:=]\s*\S+/i 
+  },
+  { 
+    type: 'Credit Card', 
+    regex: /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/ 
+  },
+  { 
+    type: 'SSN', 
+    regex: /\b\d{3}-\d{2}-\d{4}\b/ 
+  },
+];
   for (const p of patterns) {
     if (p.regex.test(text) && (!p.context || p.context.test(text))) {
       return { detected: true, type: p.type };
