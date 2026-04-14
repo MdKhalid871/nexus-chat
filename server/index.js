@@ -3,7 +3,7 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { Client, Databases, Storage, ID, Query } from 'node-appwrite';
+import { Client, Databases, Storage, Users, ID, Query } from 'node-appwrite';
 import multer from 'multer';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
@@ -34,11 +34,13 @@ const appwriteClient = new Client()
 
 const databases = new Databases(appwriteClient);
 const storage = new Storage(appwriteClient);
+const usersApi = new Users(appwriteClient);   // <-- server-side Users API
 
-const DB_ID = process.env.APPWRITE_DATABASE_ID || '';
+const DB_ID       = process.env.APPWRITE_DATABASE_ID || '';
 const MESSAGES_COL = process.env.APPWRITE_MESSAGES_COLLECTION_ID || 'messages';
-const ROOMS_COL = process.env.APPWRITE_ROOMS_COLLECTION_ID || 'rooms';
-const BUCKET_ID = process.env.APPWRITE_BUCKET_ID || 'chat-media';
+const ROOMS_COL    = process.env.APPWRITE_ROOMS_COLLECTION_ID || 'rooms';
+const DMS_COL      = process.env.APPWRITE_DMS_COLLECTION_ID || 'direct_messages';
+const BUCKET_ID    = process.env.APPWRITE_BUCKET_ID || 'chat-media';
 
 // ─── Socket.IO ────────────────────────────────────────────────────────────────
 const io = new Server(httpServer, {
@@ -47,10 +49,10 @@ const io = new Server(httpServer, {
 });
 
 // ─── In-memory state ──────────────────────────────────────────────────────────
-const onlineUsers = new Map();
-const userSockets = new Map();
-const roomMembers = new Map();
-const messageHistory = new Map();
+const onlineUsers  = new Map();   // socketId → user
+const userSockets  = new Map();   // userId   → socketId
+const roomMembers  = new Map();   // roomId   → Set<userId>
+const messageHistory = new Map(); // roomId   → [{text,sender}]
 
 // ─── Troll Detection ──────────────────────────────────────────────────────────
 const TROLL_KEYWORDS = [
@@ -64,31 +66,21 @@ function detectTroll(text) {
   const found = TROLL_KEYWORDS.filter(kw => lower.includes(kw));
   return {
     isTroll: found.length >= 2 || (found.length === 1 && lower.split(' ').length < 6),
-    keywords: found
+    keywords: found,
   };
 }
 
 function detectPrivateInfo(text) {
   const patterns = [
-  {
-    type: 'OTP',
-    // 4–8 alphanumeric characters (at least one digit)
-    regex: /\b(?=[A-Za-z0-9]{4,8}\b)(?=.*\d)[A-Za-z0-9]+\b/,
-    context: /(otp|code|verify|pin|passcode|one.?time)/i
-  },
-  { 
-    type: 'Password', 
-    regex: /(password|passwd|pwd)\s*[:=]\s*\S+/i 
-  },
-  { 
-    type: 'Credit Card', 
-    regex: /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/ 
-  },
-  { 
-    type: 'SSN', 
-    regex: /\b\d{3}-\d{2}-\d{4}\b/ 
-  },
-];
+    {
+      type: 'OTP',
+      regex: /\b(?=[A-Za-z0-9]{4,8}\b)(?=.*\d)[A-Za-z0-9]+\b/,
+      context: /(otp|code|verify|pin|passcode|one.?time)/i,
+    },
+    { type: 'Password',    regex: /(password|passwd|pwd)\s*[:=]\s*\S+/i },
+    { type: 'Credit Card', regex: /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/ },
+    { type: 'SSN',         regex: /\b\d{3}-\d{2}-\d{4}\b/ },
+  ];
   for (const p of patterns) {
     if (p.regex.test(text) && (!p.context || p.context.test(text))) {
       return { detected: true, type: p.type };
@@ -110,10 +102,10 @@ async function getSoothingResponse(text, keywords) {
               parts: [{
                 text: `Someone in a chat used these aggressive words: "${keywords.join(', ')}". 
                 Write a SHORT, warm, non-judgmental message (2-3 sentences) to gently remind them 
-                that everyone here is human and deserves respect. Sound like a caring friend, not a bot.`
-              }]
-            }]
-          })
+                that everyone here is human and deserves respect. Sound like a caring friend, not a bot.`,
+              }],
+            }],
+          }),
         }
       );
       const data = await response.json();
@@ -133,27 +125,22 @@ function defaultSoothingMessage() {
   return messages[Math.floor(Math.random() * messages.length)];
 }
 
-// ─── File Upload (saves to disk, serves as static) ────────────────────────────
+// ─── File Upload ──────────────────────────────────────────────────────────────
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => cb(null, UPLOADS_DIR),
     filename: (req, file, cb) => {
-      const uniqueName = `${Date.now()}-${uuidv4()}${path.extname(file.originalname)}`;
-      cb(null, uniqueName);
-    }
+      cb(null, `${Date.now()}-${uuidv4()}${path.extname(file.originalname)}`);
+    },
   }),
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+  limits: { fileSize: 50 * 1024 * 1024 },
 });
 
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-
     const SERVER_HOST = process.env.SERVER_HOST || `http://localhost:${process.env.PORT || 3001}`;
     const fileUrl = `${SERVER_HOST}/uploads/${req.file.filename}`;
-
-    console.log(`📁 File uploaded: ${req.file.originalname} → ${req.file.filename}`);
-
     res.json({
       fileId: req.file.filename,
       url: fileUrl,
@@ -162,26 +149,100 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       size: req.file.size,
     });
   } catch (err) {
-    console.error('❌ Upload error:', err);
     res.status(500).json({ error: 'Upload failed: ' + err.message });
   }
 });
 
-// ─── REST: Rooms ──────────────────────────────────────────────────────────────
+// ─── REST: User Search ────────────────────────────────────────────────────────
+// Returns Appwrite users whose name/email matches the query (min 2 chars)
+app.get('/users/search', async (req, res) => {
+  const q = (req.query.q || '').trim();
+  if (q.length < 2) return res.json([]);
+  try {
+    // Search by name first, fall back to listing and filtering
+    const byName = await usersApi.list([Query.search('name', q), Query.limit(10)]);
+    const results = byName.users.map(u => ({
+      $id: u.$id,
+      name: u.name,
+      email: u.email,
+    }));
+    res.json(results);
+  } catch (err) {
+    console.error('User search error:', err.message);
+    // Fallback: list all and filter client-side (if search index not enabled)
+    try {
+      const all = await usersApi.list([Query.limit(100)]);
+      const lower = q.toLowerCase();
+      const filtered = all.users
+        .filter(u => u.name?.toLowerCase().includes(lower) || u.email?.toLowerCase().includes(lower))
+        .slice(0, 10)
+        .map(u => ({ $id: u.$id, name: u.name, email: u.email }));
+      res.json(filtered);
+    } catch {
+      res.json([]);
+    }
+  }
+});
+
+// ─── REST: Rooms / Groups ─────────────────────────────────────────────────────
+// List public groups only
 app.get('/rooms', async (req, res) => {
   try {
-    const response = await databases.listDocuments(DB_ID, ROOMS_COL);
+    const response = await databases.listDocuments(DB_ID, ROOMS_COL, [
+      Query.equal('isPrivate', false),
+    ]);
     res.json(response.documents);
   } catch {
     res.json([
-      { $id: 'general', name: 'General', description: 'General chat for everyone', isPrivate: false },
-      { $id: 'random', name: 'Random', description: 'Off-topic discussions', isPrivate: false },
-      { $id: 'tech', name: 'Tech Talk', description: 'All things technology', isPrivate: false },
+      { $id: 'general', name: 'General',   description: 'General chat for everyone', isPrivate: false },
+      { $id: 'random',  name: 'Random',    description: 'Off-topic discussions',     isPrivate: false },
+      { $id: 'tech',    name: 'Tech Talk', description: 'All things technology',     isPrivate: false },
     ]);
   }
 });
 
-// ─── REST: Messages ───────────────────────────────────────────────────────────
+// Create a new group
+app.post('/rooms', async (req, res) => {
+  const { name, description, isPrivate, creatorId } = req.body;
+  if (!name) return res.status(400).json({ error: 'Name is required' });
+  try {
+    // Generate a short invite code only for private groups
+    const inviteCode = isPrivate
+      ? uuidv4().replace(/-/g, '').slice(0, 8).toUpperCase()
+      : '';
+
+    const doc = await databases.createDocument(DB_ID, ROOMS_COL, ID.unique(), {
+      name: name.trim(),
+      description: description?.trim() || '',
+      isPrivate: !!isPrivate,
+      inviteCode,
+      creatorId: creatorId || '',
+    });
+    res.json({ ...doc, inviteCode }); // inviteCode shown to creator once
+  } catch (err) {
+    console.error('Create group error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Join a private group via invite code
+app.post('/rooms/join', async (req, res) => {
+  const { inviteCode } = req.body;
+  if (!inviteCode) return res.status(400).json({ error: 'Invite code required' });
+  try {
+    const response = await databases.listDocuments(DB_ID, ROOMS_COL, [
+      Query.equal('inviteCode', inviteCode.trim().toUpperCase()),
+    ]);
+    if (response.documents.length === 0) {
+      return res.status(404).json({ error: 'Invalid or expired invite code' });
+    }
+    res.json(response.documents[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── REST: Room Messages ──────────────────────────────────────────────────────
 app.get('/messages/:roomId', async (req, res) => {
   try {
     const response = await databases.listDocuments(DB_ID, MESSAGES_COL, [
@@ -191,6 +252,36 @@ app.get('/messages/:roomId', async (req, res) => {
     ]);
     res.json(response.documents.reverse());
   } catch {
+    res.json([]);
+  }
+});
+
+// ─── REST: Direct Messages (offline delivery / history) ───────────────────────
+app.get('/dms/:userId1/:userId2', async (req, res) => {
+  const { userId1, userId2 } = req.params;
+  try {
+    // Fetch both directions separately and merge (Appwrite OR is version-dependent)
+    const [sent, received] = await Promise.all([
+      databases.listDocuments(DB_ID, DMS_COL, [
+        Query.equal('senderId',   userId1),
+        Query.equal('recipientId', userId2),
+        Query.orderAsc('$createdAt'),
+        Query.limit(100),
+      ]),
+      databases.listDocuments(DB_ID, DMS_COL, [
+        Query.equal('senderId',   userId2),
+        Query.equal('recipientId', userId1),
+        Query.orderAsc('$createdAt'),
+        Query.limit(100),
+      ]),
+    ]);
+
+    const all = [...sent.documents, ...received.documents]
+      .sort((a, b) => new Date(a.$createdAt) - new Date(b.$createdAt))
+      .slice(-100);
+    res.json(all);
+  } catch (err) {
+    console.error('DM history error:', err.message);
     res.json([]);
   }
 });
@@ -236,13 +327,13 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Room Message
+  // Room / Group Message
   socket.on('room_message', async (data) => {
     const { roomId, text, fileUrl, fileName, fileType, confirmed } = data;
     const user = onlineUsers.get(socket.id);
     if (!user) return;
 
-    // Private info check (only for text, not files)
+    // Private info check
     if (text && !confirmed) {
       const privateCheck = detectPrivateInfo(text);
       if (privateCheck.detected) {
@@ -255,20 +346,18 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Troll detection (only for text)
+    // Troll detection
     if (text && !confirmed) {
       const { isTroll, keywords } = detectTroll(text);
       if (isTroll) {
         const countData = trollCounts.get(user.userId) || { count: 0 };
         countData.count++;
         trollCounts.set(user.userId, countData);
-
         const soothingMsg = await getSoothingResponse(text, keywords);
         socket.emit('troll_warning', {
           message: soothingMsg,
           severity: countData.count >= 3 ? 'muted' : 'warning',
         });
-
         if (countData.count >= 3) {
           socket.emit('muted', { message: "🤫 You've been given a 60-second cool-down. Take a breather!" });
           setTimeout(() => {
@@ -280,7 +369,6 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Determine message type
     let msgType = 'text';
     if (fileUrl) {
       const mime = fileType || '';
@@ -303,17 +391,15 @@ io.on('connection', (socket) => {
       type: msgType,
     };
 
-    // Store history for troll context
     if (!messageHistory.has(roomId)) messageHistory.set(roomId, []);
     const history = messageHistory.get(roomId);
     history.push({ text, sender: user.username });
     if (history.length > 50) history.shift();
 
-    // Broadcast to everyone in room
     io.to(roomId).emit('room_message', message);
     console.log(`💬 [${roomId}] ${user.username}: ${text || '[file]'}`);
 
-    // Persist to Appwrite (non-blocking)
+    // Persist
     try {
       await databases.createDocument(DB_ID, MESSAGES_COL, ID.unique(), {
         roomId,
@@ -323,11 +409,11 @@ io.on('connection', (socket) => {
         fileUrl: fileUrl || '',
         fileType: fileType || '',
       });
-    } catch { /* non-fatal */ }
+    } catch (err) { console.warn('Room message persist error:', err.message); }
   });
 
-  // Direct Message
-  socket.on('direct_message', (data) => {
+  // Direct Message — persisted so offline users receive history on next login
+  socket.on('direct_message', async (data) => {
     const { toUserId, text, fileUrl, fileName, fileType } = data;
     const user = onlineUsers.get(socket.id);
     if (!user) return;
@@ -355,8 +441,27 @@ io.on('connection', (socket) => {
       isDM: true,
     };
 
+    // Always persist to Appwrite for offline delivery + history
+    try {
+      await databases.createDocument(DB_ID, DMS_COL, ID.unique(), {
+        senderId: user.userId,
+        senderName: user.username,
+        senderAvatar: user.avatar || '',
+        recipientId: toUserId,
+        text: text || '',
+        fileUrl: fileUrl || '',
+        fileName: fileName || '',
+        fileType: fileType || '',
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) { console.warn('DM persist error:', err.message); }
+
+    // Real-time delivery if recipient is online
     const recipientSocketId = userSockets.get(toUserId);
-    if (recipientSocketId) io.to(recipientSocketId).emit('direct_message', message);
+    if (recipientSocketId) {
+      io.to(recipientSocketId).emit('direct_message', message);
+    }
+    // Echo back to sender
     socket.emit('direct_message', message);
   });
 
@@ -376,14 +481,14 @@ io.on('connection', (socket) => {
     const user = onlineUsers.get(socket.id);
     if (!user) return;
     if (roomId) {
-      socket.to(roomId).emit('stop_typing', { userId: user.userId, username: user.username, roomId });
+      socket.to(roomId).emit('stop_typing', { userId: user.userId, roomId });
     } else if (toUserId) {
       const sid = userSockets.get(toUserId);
-      if (sid) io.to(sid).emit('stop_typing', { userId: user.userId, username: user.username, isDM: true });
+      if (sid) io.to(sid).emit('stop_typing', { userId: user.userId, isDM: true });
     }
   });
 
-  // Confirm private info send
+  // Confirm private-info warning and resend
   socket.on('confirm_send', (data) => {
     socket.emit('trigger_room_message', { ...data, confirmed: true });
   });

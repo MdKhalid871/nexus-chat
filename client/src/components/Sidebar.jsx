@@ -1,97 +1,378 @@
-import { Hash, MessageCircle, Users, Settings, LogOut, Plus, ChevronDown } from 'lucide-react';
+import { Hash, MessageCircle, LogOut, Plus, ChevronDown, Search, X, Lock, Globe, Loader2, Copy, Check } from 'lucide-react';
 import { useChat } from '../contexts/ChatContext';
 import { useAuth } from '../contexts/AuthContext';
-import { useState } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 
-export default function Sidebar() {
-  const { rooms, onlineUsers, activeRoom, activeDM, joinRoom, openDM } = useChat();
-  const { user, logout } = useAuth();
-  const [showOnline, setShowOnline] = useState(true);
-  const [showRooms, setShowRooms] = useState(true);
+// ── Small helper ──────────────────────────────────────────────────────────────
+function Avatar({ name, size = 'sm' }) {
+  const s = size === 'sm' ? 'w-7 h-7 text-xs' : 'w-8 h-8 text-sm';
+  return (
+    <div className={`${s} rounded-full bg-gradient-to-br from-brand-500 to-purple-500 flex items-center justify-center font-bold text-white flex-shrink-0`}>
+      {name?.[0]?.toUpperCase() || '?'}
+    </div>
+  );
+}
 
-  const others = onlineUsers.filter(u => u.userId !== user?.$id);
+// ── Group Modal (create or join) ──────────────────────────────────────────────
+function GroupModal({ onClose }) {
+  const { createGroup, joinGroupByCode, joinRoom } = useChat();
+  const [tab, setTab]             = useState('create');  // 'create' | 'join'
+  const [name, setName]           = useState('');
+  const [desc, setDesc]           = useState('');
+  const [isPrivate, setIsPrivate] = useState(false);
+  const [code, setCode]           = useState('');
+  const [loading, setLoading]     = useState(false);
+  const [error, setError]         = useState('');
+  const [newGroupCode, setNewGroupCode] = useState('');  // invite code shown after creation
+  const [copied, setCopied]       = useState(false);
+
+  async function handleCreate(e) {
+    e.preventDefault();
+    if (!name.trim()) return;
+    setLoading(true);
+    setError('');
+    try {
+      const group = await createGroup(name.trim(), desc.trim(), isPrivate);
+      if (isPrivate && group.inviteCode) {
+        setNewGroupCode(group.inviteCode);
+      } else {
+        joinRoom(group);
+        onClose();
+      }
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleJoin(e) {
+    e.preventDefault();
+    if (!code.trim()) return;
+    setLoading(true);
+    setError('');
+    try {
+      await joinGroupByCode(code.trim());
+      onClose();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function copyCode() {
+    navigator.clipboard.writeText(newGroupCode);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
+  // Show invite-code screen after private group creation
+  if (newGroupCode) {
+    return (
+      <ModalShell onClose={onClose} title="Group Created!">
+        <div className="space-y-4 text-center">
+          <div className="w-12 h-12 rounded-2xl bg-brand-500/10 flex items-center justify-center mx-auto">
+            <Lock className="w-6 h-6 text-brand-400" />
+          </div>
+          <p className="text-slate-400 text-sm">Share this invite code with people you want to add:</p>
+          <div className="flex items-center gap-2 bg-surface-3 rounded-xl p-3">
+            <code className="flex-1 text-brand-400 font-mono text-lg font-bold tracking-widest text-center">
+              {newGroupCode}
+            </code>
+            <button onClick={copyCode} className="text-slate-500 hover:text-brand-400 transition-colors">
+              {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+            </button>
+          </div>
+          <p className="text-xs text-slate-600">⚠️ Save this code — it won't be shown again.</p>
+          <button
+            onClick={() => { joinRoom({ $id: /* the doc id is in group */ newGroupCode, name }); onClose(); }}
+            className="w-full py-2.5 rounded-xl text-sm font-medium text-white transition-all"
+            style={{ background: 'linear-gradient(135deg, #0ea5e9, #6366f1)' }}
+          >
+            Go to Group
+          </button>
+        </div>
+      </ModalShell>
+    );
+  }
 
   return (
-    <aside className="w-64 flex flex-col glass border-r border-white/5 flex-shrink-0">
-      {/* Header */}
-      <div className="p-4 border-b border-white/5">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg flex items-center justify-center"
-            style={{ background: 'linear-gradient(135deg, #0ea5e9, #6366f1)' }}>
-            <span className="text-white font-display font-bold text-sm">N</span>
-          </div>
-          <div>
-            <h1 className="font-display font-bold text-sm text-white">Nexus Chat</h1>
-            <p className="text-xs text-slate-500">{others.length + 1} online</p>
-          </div>
-        </div>
+    <ModalShell onClose={onClose} title="Groups">
+      {/* Tabs */}
+      <div className="flex gap-1 bg-surface-3 rounded-xl p-1 mb-5">
+        {['create', 'join'].map(t => (
+          <button key={t} onClick={() => { setTab(t); setError(''); }}
+            className={`flex-1 py-2 text-xs font-medium rounded-lg transition-all capitalize ${tab === t ? 'bg-brand-600 text-white' : 'text-slate-400 hover:text-white'}`}>
+            {t === 'create' ? 'Create Group' : 'Join with Code'}
+          </button>
+        ))}
       </div>
 
-      {/* Scrollable content */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-4">
-        {/* Rooms */}
-        <div>
-          <button className="flex items-center justify-between w-full text-xs font-semibold text-slate-500 uppercase tracking-widest mb-2 px-1 hover:text-slate-300 transition-colors"
-            onClick={() => setShowRooms(v => !v)}>
-            <span>Channels</span>
-            <ChevronDown className={`w-3 h-3 transition-transform ${showRooms ? '' : '-rotate-90'}`} />
-          </button>
-
-          {showRooms && rooms.map(room => (
-            <button key={room.$id} onClick={() => joinRoom(room)}
-              className={`sidebar-item w-full flex items-center gap-2.5 px-3 py-2 mb-0.5 text-left ${activeRoom?.$id === room.$id ? 'active' : ''}`}>
-              <Hash className="w-4 h-4 text-slate-500 flex-shrink-0" />
-              <div className="min-w-0">
-                <p className="text-sm font-medium text-slate-200 truncate">{room.name}</p>
-                {room.description && <p className="text-xs text-slate-500 truncate">{room.description}</p>}
-              </div>
-            </button>
-          ))}
-        </div>
-
-        {/* Direct Messages */}
-        <div>
-          <button className="flex items-center justify-between w-full text-xs font-semibold text-slate-500 uppercase tracking-widest mb-2 px-1 hover:text-slate-300 transition-colors"
-            onClick={() => setShowOnline(v => !v)}>
-            <span>Direct Messages</span>
-            <ChevronDown className={`w-3 h-3 transition-transform ${showOnline ? '' : '-rotate-90'}`} />
-          </button>
-
-          {showOnline && others.map(u => (
-            <button key={u.userId} onClick={() => openDM(u)}
-              className={`sidebar-item w-full flex items-center gap-2.5 px-3 py-2 mb-0.5 text-left ${activeDM?.userId === u.userId ? 'active' : ''}`}>
-              <div className="relative flex-shrink-0">
-                <div className="w-7 h-7 rounded-full bg-gradient-to-br from-brand-500 to-purple-500 flex items-center justify-center text-xs font-bold text-white">
-                  {u.username?.[0]?.toUpperCase()}
+      {tab === 'create' ? (
+        <form onSubmit={handleCreate} className="space-y-3">
+          <input
+            type="text" placeholder="Group name" required maxLength={50}
+            value={name} onChange={e => setName(e.target.value)}
+            className="w-full bg-surface-3 border border-white/5 rounded-xl px-3 py-2.5 text-sm text-white placeholder-slate-500 outline-none focus:border-brand-500/50 transition-all"
+          />
+          <textarea
+            placeholder="Description (optional)" maxLength={200} rows={2}
+            value={desc} onChange={e => setDesc(e.target.value)}
+            className="w-full bg-surface-3 border border-white/5 rounded-xl px-3 py-2.5 text-sm text-white placeholder-slate-500 outline-none focus:border-brand-500/50 transition-all resize-none"
+          />
+          {/* Public / Private toggle */}
+          <div className="flex gap-2">
+            {[{ v: false, icon: Globe,  label: 'Public',  sub: 'Visible to everyone' },
+              { v: true,  icon: Lock,   label: 'Private', sub: 'Invite code only'    }].map(opt => (
+              <button key={String(opt.v)} type="button" onClick={() => setIsPrivate(opt.v)}
+                className={`flex-1 flex items-center gap-2 p-2.5 rounded-xl border transition-all text-left ${
+                  isPrivate === opt.v
+                    ? 'border-brand-500/50 bg-brand-500/10'
+                    : 'border-white/5 bg-surface-3 hover:border-white/10'
+                }`}>
+                <opt.icon className={`w-4 h-4 flex-shrink-0 ${isPrivate === opt.v ? 'text-brand-400' : 'text-slate-500'}`} />
+                <div>
+                  <p className={`text-xs font-medium ${isPrivate === opt.v ? 'text-brand-300' : 'text-slate-300'}`}>{opt.label}</p>
+                  <p className="text-[10px] text-slate-500">{opt.sub}</p>
                 </div>
-                <div className="absolute -bottom-0.5 -right-0.5 online-dot" />
-              </div>
-              <span className="text-sm text-slate-200 truncate">{u.username}</span>
-            </button>
-          ))}
-
-          {others.length === 0 && (
-            <p className="text-xs text-slate-600 px-3 py-2">No other users online</p>
-          )}
-        </div>
-      </div>
-
-      {/* Footer / User */}
-      <div className="p-3 border-t border-white/5">
-        <div className="flex items-center gap-3 px-2 py-2 rounded-xl hover:bg-surface-3 transition-all group">
-          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-brand-500 to-purple-500 flex items-center justify-center text-sm font-bold text-white flex-shrink-0">
-            {user?.name?.[0]?.toUpperCase()}
+              </button>
+            ))}
           </div>
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium text-white truncate">{user?.name}</p>
-            <p className="text-xs text-slate-500 truncate">{user?.email}</p>
-          </div>
-          <button onClick={logout}
-            className="opacity-0 group-hover:opacity-100 transition-opacity text-slate-500 hover:text-red-400">
-            <LogOut className="w-4 h-4" />
+
+          {error && <p className="text-red-400 text-xs">{error}</p>}
+
+          <button type="submit" disabled={loading || !name.trim()}
+            className="w-full py-2.5 rounded-xl text-sm font-medium text-white flex items-center justify-center gap-2 transition-all disabled:opacity-50"
+            style={{ background: 'linear-gradient(135deg, #0ea5e9, #6366f1)' }}>
+            {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Create Group'}
+          </button>
+        </form>
+      ) : (
+        <form onSubmit={handleJoin} className="space-y-3">
+          <input
+            type="text" placeholder="Enter invite code (e.g. A1B2C3D4)" required
+            value={code} onChange={e => setCode(e.target.value.toUpperCase())}
+            className="w-full bg-surface-3 border border-white/5 rounded-xl px-3 py-2.5 text-sm text-white font-mono placeholder-slate-500 outline-none focus:border-brand-500/50 transition-all tracking-wider"
+          />
+          {error && <p className="text-red-400 text-xs">{error}</p>}
+          <button type="submit" disabled={loading || !code.trim()}
+            className="w-full py-2.5 rounded-xl text-sm font-medium text-white flex items-center justify-center gap-2 transition-all disabled:opacity-50"
+            style={{ background: 'linear-gradient(135deg, #0ea5e9, #6366f1)' }}>
+            {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Join Group'}
+          </button>
+        </form>
+      )}
+    </ModalShell>
+  );
+}
+
+function ModalShell({ children, onClose, title }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+      <div className="glass rounded-2xl p-6 w-full max-w-sm animate-fade-in">
+        <div className="flex items-center justify-between mb-5">
+          <h3 className="font-display font-semibold text-white">{title}</h3>
+          <button onClick={onClose} className="text-slate-500 hover:text-white transition-colors">
+            <X className="w-4 h-4" />
           </button>
         </div>
+        {children}
       </div>
-    </aside>
+    </div>
+  );
+}
+
+// ── Main Sidebar ──────────────────────────────────────────────────────────────
+export default function Sidebar() {
+  const { rooms, joinedGroups, onlineUsers, activeRoom, activeDM, joinRoom, openDM, searchUsers } = useChat();
+  const { user, logout } = useAuth();
+
+  const [showRooms,    setShowRooms]    = useState(true);
+  const [showDMs,      setShowDMs]      = useState(true);
+  const [showGroupModal, setShowGroupModal] = useState(false);
+
+  // User search state
+  const [dmSearch,      setDmSearch]      = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [searching,     setSearching]     = useState(false);
+  const searchTimer = useRef(null);
+
+  // Debounced user search
+  useEffect(() => {
+    clearTimeout(searchTimer.current);
+    if (!dmSearch.trim()) { setSearchResults([]); return; }
+    setSearching(true);
+    searchTimer.current = setTimeout(async () => {
+      const results = await searchUsers(dmSearch);
+      setSearchResults(results);
+      setSearching(false);
+    }, 400);
+    return () => clearTimeout(searchTimer.current);
+  }, [dmSearch]);
+
+  // All groups to show: public rooms + private groups user has joined
+  const allGroups = [
+    ...rooms,
+    ...joinedGroups.filter(g => !rooms.find(r => r.$id === g.$id)),
+  ];
+
+  return (
+    <>
+      <aside className="w-64 flex flex-col glass border-r border-white/5 flex-shrink-0">
+        {/* Header */}
+        <div className="p-4 border-b border-white/5">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg flex items-center justify-center"
+              style={{ background: 'linear-gradient(135deg, #0ea5e9, #6366f1)' }}>
+              <span className="text-white font-display font-bold text-sm">N</span>
+            </div>
+            <div>
+              <h1 className="font-display font-bold text-sm text-white">Nexus Chat</h1>
+              <p className="text-xs text-slate-500">{onlineUsers.length} online</p>
+            </div>
+          </div>
+        </div>
+
+        {/* Scrollable */}
+        <div className="flex-1 overflow-y-auto p-3 space-y-4">
+
+          {/* ── Channels / Groups ──────────────────────────────────────── */}
+          <div>
+            <div className="flex items-center justify-between mb-2 px-1">
+              <button
+                className="flex items-center gap-1 text-xs font-semibold text-slate-500 uppercase tracking-widest hover:text-slate-300 transition-colors"
+                onClick={() => setShowRooms(v => !v)}>
+                <ChevronDown className={`w-3 h-3 transition-transform ${showRooms ? '' : '-rotate-90'}`} />
+                Channels
+              </button>
+              {/* + button opens group create/join modal */}
+              <button
+                onClick={() => setShowGroupModal(true)}
+                title="Create or join a group"
+                className="text-slate-500 hover:text-brand-400 transition-colors p-0.5 rounded">
+                <Plus className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            {showRooms && allGroups.map(room => (
+              <button key={room.$id} onClick={() => joinRoom(room)}
+                className={`sidebar-item w-full flex items-center gap-2.5 px-3 py-2 mb-0.5 text-left ${activeRoom?.$id === room.$id ? 'active' : ''}`}>
+                {room.isPrivate
+                  ? <Lock className="w-3.5 h-3.5 text-slate-500 flex-shrink-0" />
+                  : <Hash className="w-3.5 h-3.5 text-slate-500 flex-shrink-0" />}
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-slate-200 truncate">{room.name}</p>
+                  {room.description && (
+                    <p className="text-xs text-slate-500 truncate">{room.description}</p>
+                  )}
+                </div>
+              </button>
+            ))}
+          </div>
+
+          {/* ── Direct Messages ──────────────────────────────────────────── */}
+          <div>
+            <button
+              className="flex items-center gap-1 text-xs font-semibold text-slate-500 uppercase tracking-widest mb-2 px-1 hover:text-slate-300 transition-colors w-full"
+              onClick={() => setShowDMs(v => !v)}>
+              <ChevronDown className={`w-3 h-3 transition-transform ${showDMs ? '' : '-rotate-90'}`} />
+              Direct Messages
+            </button>
+
+            {showDMs && (
+              <>
+                {/* Search bar */}
+                <div className="relative mb-2">
+                  <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500 pointer-events-none" />
+                  <input
+                    type="text"
+                    placeholder="Search users…"
+                    value={dmSearch}
+                    onChange={e => setDmSearch(e.target.value)}
+                    className="w-full bg-surface-3 border border-white/5 rounded-xl pl-8 pr-8 py-2 text-xs text-white placeholder-slate-500 outline-none focus:border-brand-500/50 transition-all"
+                  />
+                  {dmSearch && (
+                    <button onClick={() => { setDmSearch(''); setSearchResults([]); }}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300">
+                      <X className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+
+                {/* Search results */}
+                {dmSearch && (
+                  searching ? (
+                    <div className="flex items-center gap-2 px-3 py-2 text-xs text-slate-500">
+                      <Loader2 className="w-3 h-3 animate-spin" /> Searching…
+                    </div>
+                  ) : searchResults.length > 0 ? (
+                    searchResults.map(u => (
+                      <button key={u.$id}
+                        onClick={() => { openDM({ ...u, userId: u.$id }); setDmSearch(''); setSearchResults([]); }}
+                        className={`sidebar-item w-full flex items-center gap-2.5 px-3 py-2 mb-0.5 text-left ${activeDM?.userId === u.$id ? 'active' : ''}`}>
+                        <div className="relative flex-shrink-0">
+                          <Avatar name={u.name} />
+                          {onlineUsers.some(ou => ou.userId === u.$id) && (
+                            <div className="absolute -bottom-0.5 -right-0.5 online-dot" />
+                          )}
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-sm text-slate-200 truncate">{u.name}</p>
+                          <p className="text-xs text-slate-500 truncate">{u.email}</p>
+                        </div>
+                      </button>
+                    ))
+                  ) : (
+                    <p className="text-xs text-slate-600 px-3 py-2">No users found for "{dmSearch}"</p>
+                  )
+                )}
+
+                {/* No search — show placeholder nudge */}
+                {!dmSearch && (
+                  <p className="text-xs text-slate-600 px-3 py-2">
+                    Search to find and message anyone
+                  </p>
+                )}
+
+                {/* Active DM shown even without search (so you can see your current DM) */}
+                {activeDM && !dmSearch && (
+                  <button
+                    className="sidebar-item w-full flex items-center gap-2.5 px-3 py-2 mb-0.5 text-left active"
+                    onClick={() => {}}>
+                    <div className="relative flex-shrink-0">
+                      <Avatar name={activeDM.name || activeDM.username} />
+                      {onlineUsers.some(u => u.userId === activeDM.userId) && (
+                        <div className="absolute -bottom-0.5 -right-0.5 online-dot" />
+                      )}
+                    </div>
+                    <span className="text-sm text-slate-200 truncate">
+                      {activeDM.name || activeDM.username}
+                    </span>
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="p-3 border-t border-white/5">
+          <div className="flex items-center gap-3 px-2 py-2 rounded-xl hover:bg-surface-3 transition-all group">
+            <Avatar name={user?.name} size="md" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium text-white truncate">{user?.name}</p>
+              <p className="text-xs text-slate-500 truncate">{user?.email}</p>
+            </div>
+            <button onClick={logout}
+              className="opacity-0 group-hover:opacity-100 transition-opacity text-slate-500 hover:text-red-400">
+              <LogOut className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      {showGroupModal && <GroupModal onClose={() => setShowGroupModal(false)} />}
+    </>
   );
 }

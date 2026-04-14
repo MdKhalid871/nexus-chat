@@ -3,6 +3,7 @@ import { AuthProvider } from './contexts/AuthContext';
 import { ChatProvider } from './contexts/ChatContext';
 import LoginPage from './pages/LoginPage';
 import ChatPage from './pages/ChatPage';
+import OAuthCallback from './pages/OAuthCallback';
 import ProtectedRoute from './components/ProtectedRoute';
 
 export default function App() {
@@ -10,7 +11,9 @@ export default function App() {
     <BrowserRouter>
       <AuthProvider>
         <Routes>
-          <Route path="/login" element={<LoginPage />} />
+          <Route path="/login"          element={<LoginPage />} />
+          {/* Google OAuth lands here, picks up the Appwrite session */}
+          <Route path="/oauth-callback" element={<OAuthCallback />} />
           <Route path="/" element={
             <ProtectedRoute>
               <ChatProvider>

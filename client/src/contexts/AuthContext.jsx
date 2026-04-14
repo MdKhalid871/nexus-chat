@@ -15,12 +15,14 @@ export function AuthProvider({ children }) {
   async function checkSession() {
     try {
       const session = await account.get();
-      const avatarUrl = avatars.getInitials(session.name, 64, 64).toString();
+      const avatarUrl = avatars.getInitials(session.name || 'User', 64, 64).toString();
       const userData = { ...session, avatar: avatarUrl };
       setUser(userData);
       connectSocket({ userId: session.$id, username: session.name, avatar: avatarUrl });
+      return userData;
     } catch {
       setUser(null);
+      return null;
     } finally {
       setLoading(false);
     }
@@ -36,18 +38,38 @@ export function AuthProvider({ children }) {
     await login(email, password);
   }
 
-  async function loginWithGoogle() {
-    account.createOAuth2Session('google', `${window.location.origin}/`, `${window.location.origin}/login`);
+  /**
+   * Google OAuth — Fix for Appwrite v14
+   *
+   * Uses a dedicated /oauth-callback route as the success URL so the app
+   * can explicitly call checkSession() after the redirect returns.
+   *
+   * You MUST add these URLs to your Appwrite project:
+   *   Platform → Web → Hostname: your-vercel-app.vercel.app
+   *   OAuth2 → Google → Redirect URLs: https://your-vercel-app.vercel.app/oauth-callback
+   *
+   * AND in Google Cloud Console → Credentials → OAuth Client:
+   *   Authorised redirect URIs: https://cloud.appwrite.io/v1/account/sessions/oauth2/callback/google/<your-project-id>
+   */
+  function loginWithGoogle() {
+    const origin = window.location.origin;
+    account.createOAuth2Session(
+      'google',
+      `${origin}/oauth-callback`,   // success — our handler calls checkSession
+      `${origin}/login`             // failure
+    );
   }
 
   async function logout() {
-    await account.deleteSession('current');
+    try {
+      await account.deleteSession('current');
+    } catch { /* already expired */ }
     disconnectSocket();
     setUser(null);
   }
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, register, logout, loginWithGoogle }}>
+    <AuthContext.Provider value={{ user, loading, login, register, logout, loginWithGoogle, checkSession }}>
       {children}
     </AuthContext.Provider>
   );
