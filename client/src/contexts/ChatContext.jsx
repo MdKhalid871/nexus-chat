@@ -6,11 +6,18 @@ const ChatContext = createContext(null);
 
 const SERVER = () => import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
 
+// ── Only General as default ───────────────────────────────────────────────────
 const FALLBACK_ROOMS = [
-  { $id: 'general', name: 'General',   description: 'General chat for everyone', isPrivate: false },
-  { $id: 'random',  name: 'Random',    description: 'Off-topic discussions',     isPrivate: false },
-  { $id: 'tech',    name: 'Tech Talk', description: 'All things technology',     isPrivate: false },
+  { $id: 'general', name: 'General', description: 'General chat for everyone', isPrivate: false },
 ];
+
+// ── localStorage helpers (keyed per user so different users don't clash) ──────
+function lsGet(key, fallback) {
+  try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
+}
+function lsSet(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+}
 
 export function ChatProvider({ children }) {
   const { user } = useAuth();
@@ -26,12 +33,38 @@ export function ChatProvider({ children }) {
   const [privateInfoWarning,  setPrivateInfoWarning]  = useState(null);
   const [notification,        setNotification]        = useState(null);
   const [muted,               setMuted]               = useState(false);
-  // Groups the current user has joined (stored in local state for sidebar)
-  const [joinedGroups,        setJoinedGroups]        = useState([]);
+
+  // Private groups the user has joined — persisted to localStorage per user
+  const [joinedGroups, setJoinedGroups] = useState([]);
+
+  // DM contacts the user has opened — persisted to localStorage per user
+  const [dmContacts, setDmContacts] = useState([]);
 
   const activeRoomRef = useRef(null);
 
-  // ── Socket setup ────────────────────────────────────────────────────────────
+  // ── Load persisted data once user is known ───────────────────────────────────
+  useEffect(() => {
+    if (!user?.$id) return;
+
+    const savedGroups = lsGet(`nexus_joined_groups_${user.$id}`, []);
+    const savedContacts = lsGet(`nexus_dm_contacts_${user.$id}`, []);
+    setJoinedGroups(savedGroups);
+    setDmContacts(savedContacts);
+  }, [user?.$id]);
+
+  // ── Persist joinedGroups whenever it changes ──────────────────────────────────
+  useEffect(() => {
+    if (!user?.$id) return;
+    lsSet(`nexus_joined_groups_${user.$id}`, joinedGroups);
+  }, [joinedGroups, user?.$id]);
+
+  // ── Persist dmContacts whenever it changes ────────────────────────────────────
+  useEffect(() => {
+    if (!user?.$id) return;
+    lsSet(`nexus_dm_contacts_${user.$id}`, dmContacts);
+  }, [dmContacts, user?.$id]);
+
+  // ── Socket setup ─────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!user) return;
 
@@ -53,6 +86,14 @@ export function ChatProvider({ children }) {
     socket.on('unmuted', ({ message }) => { setMuted(false); showNotification(message, 'success'); });
     socket.on('trigger_room_message', (data) => socket.emit('room_message', data));
 
+    // ── New public room broadcast (so all users see newly created public channels)
+    socket.on('new_public_room', (room) => {
+      setRooms(prev => {
+        if (prev.find(r => r.$id === room.$id)) return prev;
+        return [...prev, room];
+      });
+    });
+
     return () => {
       socket.off('online_users');
       socket.off('room_message');
@@ -65,10 +106,11 @@ export function ChatProvider({ children }) {
       socket.off('muted');
       socket.off('unmuted');
       socket.off('trigger_room_message');
+      socket.off('new_public_room');
     };
   }, [user]);
 
-  // ── Fetch public rooms ───────────────────────────────────────────────────────
+  // ── Fetch public rooms ────────────────────────────────────────────────────────
   async function fetchRooms() {
     try {
       const controller = new AbortController();
@@ -84,21 +126,38 @@ export function ChatProvider({ children }) {
     }
   }
 
-  // ── User search (for DMs) ────────────────────────────────────────────────────
+  // ── User search (for DMs) ─────────────────────────────────────────────────────
   async function searchUsers(query) {
     if (!query || query.trim().length < 2) return [];
     try {
       const res = await fetch(`${SERVER()}/users/search?q=${encodeURIComponent(query.trim())}`);
       if (!res.ok) return [];
       const data = await res.json();
-      // exclude self
       return data.filter(u => u.$id !== user?.$id);
     } catch {
       return [];
     }
   }
 
-  // ── Group creation ───────────────────────────────────────────────────────────
+  // ── DM Contacts management ────────────────────────────────────────────────────
+  function addDMContact(targetUser) {
+    const id = targetUser.$id || targetUser.userId;
+    setDmContacts(prev => {
+      if (prev.find(c => (c.$id || c.userId) === id)) return prev;
+      return [...prev, { ...targetUser, $id: id, userId: id }];
+    });
+  }
+
+  function removeDMContact(userId) {
+    setDmContacts(prev => prev.filter(c => (c.$id || c.userId) !== userId));
+    // If the removed contact is active, clear the DM view
+    setActiveDM(prev => {
+      if (prev && (prev.$id === userId || prev.userId === userId)) return null;
+      return prev;
+    });
+  }
+
+  // ── Group creation ────────────────────────────────────────────────────────────
   async function createGroup(name, description, isPrivate) {
     const res = await fetch(`${SERVER()}/rooms`, {
       method: 'POST',
@@ -111,17 +170,24 @@ export function ChatProvider({ children }) {
     }
     const group = await res.json();
 
-    // If public, add to room list; if private, add to personal joinedGroups
     if (!isPrivate) {
-      setRooms(prev => [...prev, group]);
+      // Public room — server will broadcast to all via socket; add locally too
+      setRooms(prev => {
+        if (prev.find(r => r.$id === group.$id)) return prev;
+        return [...prev, group];
+      });
     } else {
-      setJoinedGroups(prev => [...prev, group]);
+      // Private group — save to this user's persisted joinedGroups
+      setJoinedGroups(prev => {
+        if (prev.find(g => g.$id === group.$id)) return prev;
+        return [...prev, group];
+      });
     }
 
-    return group; // caller can show inviteCode to user
+    return group;
   }
 
-  // ── Join private group via invite code ───────────────────────────────────────
+  // ── Join private group via invite code ────────────────────────────────────────
   async function joinGroupByCode(inviteCode) {
     const res = await fetch(`${SERVER()}/rooms/join`, {
       method: 'POST',
@@ -141,7 +207,7 @@ export function ChatProvider({ children }) {
     return group;
   }
 
-  // ── Join a room ──────────────────────────────────────────────────────────────
+  // ── Join a room ───────────────────────────────────────────────────────────────
   function joinRoom(room) {
     const socket = getSocket();
     const roomId = room.$id || room.id;
@@ -156,6 +222,14 @@ export function ChatProvider({ children }) {
     setActiveDM(null);
     socket.emit('join_room', { roomId });
 
+    // Save public channel to user's joined channels if not already there
+    if (!normalizedRoom.isPrivate) {
+      setJoinedGroups(prev => {
+        // public rooms are in `rooms` list, no need to duplicate into joinedGroups
+        return prev;
+      });
+    }
+
     // Fetch persisted room history
     fetch(`${SERVER()}/messages/${roomId}`)
       .then(r => r.json())
@@ -167,14 +241,17 @@ export function ChatProvider({ children }) {
       .catch(() => {});
   }
 
-  // ── Open a DM — also fetches offline history ─────────────────────────────────
+  // ── Open a DM — also fetches offline history ──────────────────────────────────
   function openDM(targetUser) {
     const targetId = targetUser.$id || targetUser.userId;
-    setActiveDM({ ...targetUser, userId: targetId });
+    const contact = { ...targetUser, $id: targetId, userId: targetId };
+    setActiveDM(contact);
     activeRoomRef.current = null;
     setActiveRoom(null);
 
-    // Fetch DM history (includes messages sent while either user was offline)
+    // Persist this contact
+    addDMContact(contact);
+
     if (user?.$id && targetId) {
       fetch(`${SERVER()}/dms/${user.$id}/${targetId}`)
         .then(r => r.json())
@@ -203,7 +280,7 @@ export function ChatProvider({ children }) {
     }
   }
 
-  // ── Message handlers ─────────────────────────────────────────────────────────
+  // ── Message handlers ──────────────────────────────────────────────────────────
   function handleRoomMessage(msg) {
     setMessages(prev => ({
       ...prev,
@@ -215,7 +292,6 @@ export function ChatProvider({ children }) {
     const key = msg.senderId === user?.$id ? msg.toUserId : msg.senderId;
     setDmMessages(prev => {
       const existing = prev[key] || [];
-      // Avoid duplicate if we already loaded from history
       if (existing.find(m => m.id === msg.id)) return prev;
       return { ...prev, [key]: [...existing, msg] };
     });
@@ -258,7 +334,7 @@ export function ChatProvider({ children }) {
     setPrivateInfoWarning(data);
   }
 
-  // ── Send helpers ─────────────────────────────────────────────────────────────
+  // ── Send helpers ──────────────────────────────────────────────────────────────
   function sendRoomMessage(text, fileData = null) {
     if (!activeRoomRef.current || muted) return;
     const socket = getSocket();
@@ -315,13 +391,14 @@ export function ChatProvider({ children }) {
       onlineUsers, rooms, joinedGroups, activeRoom, activeDM,
       messages, dmMessages, typingUsers,
       trollWarning, privateInfoWarning, notification, muted,
+      dmContacts,
       // actions
       joinRoom, openDM, sendRoomMessage, sendDM,
       emitTypingStart, emitTypingStop,
       setTrollWarning, setPrivateInfoWarning,
       confirmPrivateInfoSend, showNotification,
       searchUsers, createGroup, joinGroupByCode,
-      fetchRooms,
+      fetchRooms, addDMContact, removeDMContact,
     }}>
       {children}
     </ChatContext.Provider>

@@ -194,9 +194,7 @@ app.get('/rooms', async (req, res) => {
     res.json(response.documents);
   } catch {
     res.json([
-      { $id: 'general', name: 'General',   description: 'General chat for everyone', isPrivate: false },
-      { $id: 'random',  name: 'Random',    description: 'Off-topic discussions',     isPrivate: false },
-      { $id: 'tech',    name: 'Tech Talk', description: 'All things technology',     isPrivate: false },
+      { $id: 'general', name: 'General', description: 'General chat for everyone', isPrivate: false },
     ]);
   }
 });
@@ -219,6 +217,9 @@ app.post('/rooms', async (req, res) => {
       creatorId: creatorId || '',
     });
     res.json({ ...doc, inviteCode }); // inviteCode shown to creator once
+    if (!isPrivate) {
+      io.emit('new_public_room', { ...doc });
+    }
   } catch (err) {
     console.error('Create group error:', err.message);
     res.status(500).json({ error: err.message });
